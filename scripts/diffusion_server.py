@@ -925,6 +925,10 @@ def _get_inpaint_pipe():
         if cls:
             try:
                 _inpaint_pipe = cls.from_pipe(_pipe)
+                if _args.cpu_offload:
+                    # from_pipe doesn't inherit offload hooks — without this the
+                    # shared components get moved fully onto the GPU and OOM.
+                    _inpaint_pipe.enable_model_cpu_offload()
                 logger.info(f"Loaded inpaint pipeline: {name}")
                 return _inpaint_pipe, 'inpaint'
             except Exception as e:
@@ -951,6 +955,8 @@ def _get_inpaint_pipe():
                     _img2img_pipe = _img2img_pipe.to(f"cuda:{harmonize_gpu}")
                 else:
                     _img2img_pipe = cls.from_pipe(_pipe, torch_dtype=torch_dtype)
+                    if _args.cpu_offload:
+                        _img2img_pipe.enable_model_cpu_offload()
                 logger.info(f"Loaded img2img pipeline: {name}" + (f" on cuda:{harmonize_gpu}" if harmonize_gpu is not None else ""))
                 return _img2img_pipe, 'img2img'
             except Exception as e:
