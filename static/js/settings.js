@@ -8,6 +8,7 @@ import { clearDockSide } from './modalSnap.js';
 import { sortModelIds } from './modelSort.js';
 import { providerLogo } from './providers.js';
 import { isAltGrEvent } from './platform.js';
+import { bindMenuDismiss } from './escMenuStack.js';
 
 let initialized = false;
 let modalEl = null;
@@ -40,6 +41,7 @@ function initTabs() {
       document.body.classList.toggle('settings-appearance-open', tab === 'appearance');
       syncAppearanceOpacity(tab === 'appearance');
       if (tab === 'ai') refreshAiModelEndpoints();
+      if (tab === 'mobile') loadMobileSessions();
     });
   });
 }
@@ -541,6 +543,9 @@ async function initDefaultChat() {
     renderFallbacks();
   } catch (e) { console.warn('Failed to load default chat settings', e); }
 
+  epSel.addEventListener('change', function() { refreshModels(''); saveDefault(); });
+  modelSel.addEventListener('change', saveDefault);
+
   async function saveDefault() {
     try {
       var clean = _fallbacks.filter(function(f) { return f.endpoint_id && f.model; });
@@ -557,8 +562,6 @@ async function initDefaultChat() {
     } catch (e) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
   }
 
-  epSel.addEventListener('change', function() { refreshModels(''); saveDefault(); });
-  modelSel.addEventListener('change', saveDefault);
   if (addFbBtn) addFbBtn.addEventListener('click', function() {
     var first = enabledEndpoints()[0];
     _fallbacks.push({ endpoint_id: first ? first.id : '', model: '' });
@@ -1721,24 +1724,6 @@ async function initAgentSettings() {
     (curR != null ? ' · ' + curR + ' steps/message' : '') +
     (supInput && supInput.checked ? ' · supervisor on' : '');
 
-  // Standalone Email Safety toggle (separate card on the AI Defaults tab).
-  // Default to ON if the setting isn't present so a fresh install is safe.
-  var emailConfirm = el('set-agentEmailConfirm');
-  if (emailConfirm) {
-    try {
-      var s = await fetch('/api/auth/settings', { credentials: 'same-origin' }).then(r => r.json());
-      emailConfirm.checked = s.agent_email_confirm !== false;
-    } catch (_) {}
-    emailConfirm.addEventListener('change', async () => {
-      try {
-        await fetch('/api/auth/settings', {
-          method: 'POST', credentials: 'same-origin',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ agent_email_confirm: !!emailConfirm.checked }),
-        });
-      } catch (_) {}
-    });
-  }
 }
 
 /* ═══════════════════════════════════════════
@@ -2338,6 +2323,7 @@ function initAll() {
   initClose();
   initOpenPromptModalLink();
   initOpacityToggle();
+  initMobile();
   initialized = true;
   initDefaultChat();
   initTeacherModel();
@@ -3122,6 +3108,28 @@ async function initEmailSettings() {
   const root = el('settings-modal');
   if (!root || !root.querySelector('[data-settings-panel="email"]')) return;
 
+  const styleKey = 'odysseus-email-writing-style';
+  const styleEl = el('set-email-style');
+
+  // The account/CardDAV config endpoints can be slow when remote mail servers
+  // are cold. Populate the Writing Style box independently so saved prose does
+  // not appear seconds after the panel opens.
+  try {
+    const cachedStyle = localStorage.getItem(styleKey);
+    if (styleEl && cachedStyle !== null && !styleEl.value) styleEl.value = cachedStyle;
+  } catch (_) {}
+
+  const loadWritingStyle = async () => {
+    try {
+      const res = await fetch('/api/email/style');
+      const data = await res.json();
+      const style = data.style || '';
+      if (styleEl) styleEl.value = style;
+      try { localStorage.setItem(styleKey, style); } catch (_) {}
+    } catch (_) {}
+  };
+  loadWritingStyle();
+
   // Load current email config
   try {
     const res = await fetch('/api/email/config');
@@ -3144,13 +3152,6 @@ async function initEmailSettings() {
     if (el('set-carddav-url')) el('set-carddav-url').value = cfg.url || '';
     if (el('set-carddav-user')) el('set-carddav-user').value = cfg.username || '';
     if (el('set-carddav-pass')) el('set-carddav-pass').value = '';
-  } catch (_) {}
-
-  // Load writing style
-  try {
-    const res = await fetch('/api/email/style');
-    const data = await res.json();
-    if (el('set-email-style')) el('set-email-style').value = data.style || '';
   } catch (_) {}
 
   // Save email config
@@ -3243,7 +3244,8 @@ async function initEmailSettings() {
       });
       const data = await res.json();
       if (data.success && data.style) {
-        if (el('set-email-style')) el('set-email-style').value = data.style;
+        if (styleEl) styleEl.value = data.style;
+        try { localStorage.setItem(styleKey, data.style); } catch (_) {}
         if (msg) msg.textContent = '✓ Style extracted';
       } else {
         if (msg) msg.textContent = data.error || 'Failed';
@@ -3262,12 +3264,16 @@ async function initEmailSettings() {
     const msg = el('set-email-style-msg');
     if (msg) msg.textContent = 'Saving...';
     try {
+      const style = styleEl ? styleEl.value : '';
       const res = await fetch('/api/email/style', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ style: el('set-email-style').value }),
+        body: JSON.stringify({ style }),
       });
       const result = await res.json();
+      if (result.success) {
+        try { localStorage.setItem(styleKey, style); } catch (_) {}
+      }
       if (msg) msg.textContent = result.success ? '✓ Saved' : 'Failed';
       setTimeout(() => { if (msg) msg.textContent = ''; }, 3000);
     } catch (e) {
@@ -3838,7 +3844,10 @@ async function initUnifiedIntegrations() {
         if (lbl) lbl.textContent = text;
         if (ico) ico.innerHTML = _apiIconFor(k);
       };
-      const _close = () => { menu.style.display = 'none'; };
+      // Menu is reused (hidden, not recreated). close() hides it and tears down
+      // its outside-click listener + Escape-stack entry; bindMenuDismiss is
+      // re-registered fresh on each open (see _open).
+      let _close = () => { menu.style.display = 'none'; };
       const _open = () => {
         menu.style.display = 'block';
         const tRect = trig.getBoundingClientRect();
@@ -3847,8 +3856,7 @@ async function initUnifiedIntegrations() {
         const above = tRect.top;
         if (mRect.height > below && above > below) { menu.style.top = 'auto'; menu.style.bottom = 'calc(100% + 2px)'; }
         else { menu.style.top = 'calc(100% + 2px)'; menu.style.bottom = 'auto'; }
-        const onDoc = (ev) => { if (!menu.contains(ev.target) && ev.target !== trig) { _close(); document.removeEventListener('click', onDoc, true); } };
-        setTimeout(() => document.addEventListener('click', onDoc, true), 0);
+        _close = bindMenuDismiss(menu, () => { menu.style.display = 'none'; }, (ev) => !menu.contains(ev.target) && ev.target !== trig);
       };
       trig.addEventListener('click', (e) => { e.stopPropagation(); menu.style.display === 'block' ? _close() : _open(); });
       menu.querySelectorAll('.ufapi-option').forEach(btn => {
@@ -4584,7 +4592,10 @@ async function initUnifiedIntegrations() {
         if (labelEl) labelEl.textContent = lbl;
         if (iconEl) iconEl.innerHTML = PROV_LOGO[k] || _customLogo;
       };
-      const _closeMenu = () => { menu.style.display = 'none'; };
+      // Menu is reused (hidden, not recreated). _closeMenu hides it and tears
+      // down its outside-click listener + Escape-stack entry; bindMenuDismiss is
+      // re-registered fresh on each open (see _openMenu).
+      let _closeMenu = () => { menu.style.display = 'none'; };
       const _openMenu = () => {
         menu.style.display = 'block';
         // Drop-up when there's not enough room below the trigger.
@@ -4597,8 +4608,7 @@ async function initUnifiedIntegrations() {
         } else {
           menu.style.top = 'calc(100% + 2px)'; menu.style.bottom = 'auto';
         }
-        const onDoc = (ev) => { if (!menu.contains(ev.target) && ev.target !== trigger) { _closeMenu(); document.removeEventListener('click', onDoc, true); } };
-        setTimeout(() => document.addEventListener('click', onDoc, true), 0);
+        _closeMenu = bindMenuDismiss(menu, () => { menu.style.display = 'none'; }, (ev) => !menu.contains(ev.target) && ev.target !== trigger);
       };
       trigger.addEventListener('click', (e) => { e.stopPropagation(); menu.style.display === 'block' ? _closeMenu() : _openMenu(); });
       menu.querySelectorAll('.ufp-option').forEach(btn => {
@@ -5650,8 +5660,11 @@ async function initUnifiedIntegrations() {
       addBtn.parentElement.style.position = 'relative';
       addBtn.parentElement.classList.add('uf-add-anchor');
     }
+    // Menu is created per open and removed on close. _closeMenu routes through
+    // the bindMenuDismiss close() bound when the menu opens, so the outside-click
+    // listener + Escape-stack entry are torn down alongside the node removal.
     let _menuEl = null;
-    const _closeMenu = () => { if (_menuEl) { _menuEl.remove(); _menuEl = null; } };
+    let _closeMenu = () => {};
     addBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       if (_menuEl) { _closeMenu(); return; }
@@ -5683,8 +5696,7 @@ async function initUnifiedIntegrations() {
           showForm(k, 'new');
         });
       });
-      const onDoc = (ev) => { if (!menu.contains(ev.target) && ev.target !== addBtn) { _closeMenu(); document.removeEventListener('click', onDoc, true); } };
-      setTimeout(() => document.addEventListener('click', onDoc, true), 0);
+      _closeMenu = bindMenuDismiss(menu, () => { menu.remove(); _menuEl = null; }, (ev) => !menu.contains(ev.target) && ev.target !== addBtn);
     });
   }
 
@@ -5781,5 +5793,123 @@ export function close() {
 
 const settingsModule = { open, close, initIntegrations, initUnifiedIntegrations, syncAdminVisibility, refreshAiModelEndpoints };
 
+
+// ── Mobile App settings ──────────────────────────────────────────────────────
+
+function _esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+function loadMobileSessions() {
+  const listEl = el('mobile-sessions-list');
+  if (!listEl) return;
+  listEl.innerHTML = '<div style="font-size:11px;opacity:0.5;padding:6px 0;">Loading…</div>';
+  fetch('/api/tokens/mobile', { credentials: 'same-origin' })
+    .then(r => r.ok ? r.json() : [])
+    .then(tokens => {
+      if (!tokens.length) {
+        listEl.innerHTML = '<div style="font-size:11px;opacity:0.5;padding:6px 0;">No active mobile sessions.</div>';
+        return;
+      }
+      listEl.innerHTML = tokens.map(t => {
+        const used = t.last_used_at ? new Date(t.last_used_at).toLocaleString() : 'Never';
+        const created = t.created_at ? new Date(t.created_at).toLocaleDateString() : '';
+        return `<div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border);">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="opacity:0.5;flex-shrink:0;"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
+          <div style="flex:1;min-width:0;">
+            <div style="font-size:12px;font-weight:600;">${_esc(t.name)}</div>
+            <div style="font-size:10px;opacity:0.55;">${_esc(t.token_prefix)}… · Created ${_esc(created)} · Last used ${_esc(used)}</div>
+          </div>
+          <button class="admin-btn-sm" data-revoke-id="${_esc(t.id)}" style="color:var(--color-error);border-color:var(--color-error);background:transparent;display:inline-flex;align-items:center;gap:4px;font-size:11px;">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            Revoke
+          </button>
+        </div>`;
+      }).join('');
+      listEl.querySelectorAll('[data-revoke-id]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const id = btn.dataset.revokeId;
+          btn.disabled = true;
+          btn.textContent = '…';
+          fetch(`/api/tokens/mobile/${id}`, { method: 'DELETE', credentials: 'same-origin' })
+            .then(() => loadMobileSessions())
+            .catch(() => { btn.disabled = false; btn.textContent = 'Revoke'; });
+        });
+      });
+    })
+    .catch(() => {
+      listEl.innerHTML = '<div style="font-size:11px;opacity:0.5;">Failed to load sessions.</div>';
+    });
+}
+
+function initMobile() {
+  // Populate server URL hint
+  const hintEl = el('mobile-server-url-hint');
+  if (hintEl) hintEl.textContent = window.location.origin + '/';
+
+  // Load QRCode lib lazily
+  if (!window.QRCode) {
+    const s = document.createElement('script');
+    s.src = '/static/lib/qrcode.min.js';
+    document.head.appendChild(s);
+  }
+
+  // Generate token
+  const genBtn = el('mobile-token-generate-btn');
+  const revealEl = el('mobile-token-reveal');
+  const tokenValueEl = el('mobile-token-value');
+  const copyBtn = el('mobile-token-copy-btn');
+  const copyMsgEl = el('mobile-token-copy-msg');
+  const msgEl = el('mobile-token-msg');
+  const nameInput = el('mobile-token-name');
+
+  if (!genBtn) return;
+
+  genBtn.addEventListener('click', async () => {
+    const name = (nameInput && nameInput.value.trim()) || '';
+    genBtn.disabled = true;
+    const origLabel = genBtn.innerHTML;
+    genBtn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/></svg> Generating…';
+    revealEl.style.display = 'none';
+    msgEl.textContent = '';
+    msgEl.style.color = '';
+    
+    try {
+      const res = await fetch('/api/tokens/mobile', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+        credentials: 'same-origin'
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      tokenValueEl.textContent = data.token;
+      revealEl.style.display = 'block';
+      if (nameInput) nameInput.value = '';
+      loadMobileSessions();
+
+      if (window.QRCode) {
+        const cvs = el('mobile-qr-canvas');
+        if (cvs) {
+          const qrUrl = window.location.origin + '/?mobile_token=' + encodeURIComponent(data.token);
+          QRCode.toCanvas(cvs, qrUrl, { width: 180, margin: 2, color: { dark: '#000000ff', light: '#ffffffff' } });
+        }
+      }
+    } catch (e) {
+      msgEl.style.color = 'var(--color-error)';
+      msgEl.textContent = 'Failed to generate token: ' + e.message;
+    } finally {
+      genBtn.disabled = false;
+      genBtn.innerHTML = origLabel;
+    }
+  });
+
+  if (copyBtn) {
+    copyBtn.addEventListener('click', () => {
+      navigator.clipboard.writeText(tokenValueEl.textContent).then(() => {
+        copyMsgEl.textContent = 'Token copied to clipboard!';
+        setTimeout(() => { copyMsgEl.textContent = ''; }, 3000);
+      });
+    });
+  }
+}
 
 export default settingsModule;

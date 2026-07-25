@@ -1,0 +1,54 @@
+# Built artifacts
+*.apk
+*.aab
+*.dex
+*.class
+bin/
+build/
+out/
+release/
+
+# Gradle
+.gradle/
+gradle-app.setting
+!gradle-wrapper.jar
+!gradle-wrapper.properties
+local.properties
+.gradletasknamecache
+
+# Android Studio / IntelliJ
+*.iml
+.idea/
+*.iws
+*.ipr
+captures/
+.externalNativeBuild/
+.cxx/
+*.hprof
+.navigation/
+lint-results*
+
+# OS
+.DS_Store
+.DS_Store?
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# Secrets — NEVER commit these
+.env
+local.properties
+keystore.jks
+*.keystore
+*.jks
+google-services.json
+secrets.properties
+
+# Generated
+generated/
+R.java
+
+# Test results
+*.xml
+!**/res/**/*.xml
+!**/main/AndroidManifest.xml

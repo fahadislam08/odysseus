@@ -14,6 +14,7 @@ MAX_NAME_LEN = 100
 DEFAULT_SCOPES = "chat"
 ALLOWED_SCOPES = {
     "chat",
+    "mobile",
     "todos:read",
     "todos:write",
     "documents:read",
@@ -27,9 +28,21 @@ ALLOWED_SCOPES = {
     "memory:write",
     "cookbook:read",
     "cookbook:launch",
+    "notes:read",
+    "notes:write",
 }
 TOKEN_PROFILES = {
     "chat": ["chat"],
+    "mobile_app": [
+        "mobile",
+        "chat",
+        "todos:read", "todos:write",
+        "documents:read", "documents:write",
+        "email:read", "email:draft",
+        "calendar:read", "calendar:write",
+        "memory:read", "memory:write",
+        "notes:read", "notes:write",
+    ],
     "codex_todos": ["todos:read", "todos:write"],
     "codex_documents": ["documents:read", "documents:write"],
     "codex_email_drafts": ["email:read", "email:draft", "documents:read", "documents:write"],
@@ -75,6 +88,82 @@ def _normalize_scopes(scopes: str | list[str] | None = None, profile: str | None
 
 def setup_api_token_routes() -> APIRouter:
     router = APIRouter(prefix="/api", tags=["api_tokens"])
+
+    # ── Mobile token helpers (user-level, no admin required) ──────────────────
+
+    @router.get("/tokens/mobile")
+    def list_mobile_tokens(request: Request):
+        """List the calling user's own mobile tokens."""
+        current_user = get_current_user(request)
+        if not current_user:
+            raise HTTPException(401, "Not authenticated")
+        with get_db_session() as db:
+            tokens = (
+                db.query(ApiToken)
+                .filter(ApiToken.owner == current_user, ApiToken.is_active == True)  # noqa: E712
+                .all()
+            )
+            return [
+                {
+                    "id": t.id,
+                    "name": t.name,
+                    "token_prefix": t.token_prefix,
+                    "scopes": [s.strip() for s in (getattr(t, "scopes", "") or DEFAULT_SCOPES).split(",") if s.strip()],
+                    "last_used_at": t.last_used_at.isoformat() if t.last_used_at else None,
+                    "created_at": t.created_at.isoformat() if t.created_at else None,
+                }
+                for t in tokens
+                if "mobile" in (getattr(t, "scopes", "") or "")
+            ]
+
+    @router.post("/tokens/mobile")
+    def create_mobile_token(request: Request, name: str = Form("")):
+        """Create a mobile app token for the calling user."""
+        current_user = get_current_user(request)
+        if not current_user:
+            raise HTTPException(401, "Not authenticated")
+        name = (name.strip() or f"Mobile — {current_user}")[:MAX_NAME_LEN]
+        scope_list = _normalize_scopes(profile="mobile_app")
+        raw_token = "ody_" + secrets.token_urlsafe(32)
+        token_hash = bcrypt.hashpw(raw_token.encode(), bcrypt.gensalt()).decode()
+        token_id = str(uuid.uuid4())[:8]
+        with get_db_session() as db:
+            db.add(ApiToken(
+                id=token_id,
+                owner=current_user,
+                name=name,
+                token_hash=token_hash,
+                token_prefix=raw_token[:8],
+                scopes=",".join(scope_list),
+                is_active=True,
+            ))
+        _invalidate_cache(request)
+        return {
+            "id": token_id,
+            "name": name,
+            "owner": current_user,
+            "token": raw_token,
+            "token_prefix": raw_token[:8],
+            "scopes": scope_list,
+        }
+
+    @router.delete("/tokens/mobile/{token_id}")
+    def revoke_mobile_token(request: Request, token_id: str):
+        """Revoke a mobile token owned by the calling user."""
+        current_user = get_current_user(request)
+        if not current_user:
+            raise HTTPException(401, "Not authenticated")
+        with get_db_session() as db:
+            token = db.query(ApiToken).filter(ApiToken.id == token_id).first()
+            if not token:
+                raise HTTPException(404, "Token not found")
+            if token.owner != current_user:
+                raise HTTPException(403, "Not your token")
+            db.delete(token)
+        _invalidate_cache(request)
+        return {"status": "revoked"}
+
+    # ── Admin token endpoints ─────────────────────────────────────────────────
 
     @router.get("/tokens")
     def list_tokens(request: Request):

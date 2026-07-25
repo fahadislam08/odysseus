@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+    <!-- By default, Android blocks HTTP. We allow it here because the user's self-hosted EC2 instance 
+         might not have TLS configured yet. For better security, Let's Encrypt / HTTPS is recommended. -->
+</network-security-config>

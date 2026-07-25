@@ -175,8 +175,18 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
 
     @router.get("/status")
     async def auth_status(request: Request):
-        token = request.cookies.get(SESSION_COOKIE)
-        result = auth_manager.status(token)
+        from src.auth_helpers import effective_user as _effective_user
+        cookie_token = request.cookies.get(SESSION_COOKIE)
+        result = auth_manager.status(cookie_token)
+        if not result.get("authenticated"):
+            bearer_user = _effective_user(request)
+            if bearer_user:
+                result = {
+                    "authenticated": True,
+                    "username": bearer_user,
+                    "configured": True,
+                    "is_admin": auth_manager.is_admin(bearer_user)
+                }
         result["signup_enabled"] = auth_manager.signup_enabled
         # Include the caller's effective privileges so the frontend can
         # hide / dim UI controls the user isn't allowed to use. Admins get

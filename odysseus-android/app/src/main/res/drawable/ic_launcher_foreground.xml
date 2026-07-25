@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Odysseus ship — mirrors the webapp welcome-screen boat SVG exactly.
+    Original viewBox: 0 0 32 32, scaled x3.375 to fit 108dp adaptive-icon safe zone.
+    Left sail  M16,4  → M54,13.5
+    Right sail M16,8  → M54,27
+    Hull       M4,24  → M13.5,81
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Left sail (large triangle) -->
+    <path
+        android:fillColor="#9CDEF2"
+        android:pathData="M54,13.5 L54,74.25 L20.25,74.25 Z" />
+
+    <!-- Right sail (smaller triangle, partially transparent) -->
+    <path
+        android:fillColor="#9CDEF2"
+        android:fillAlpha="0.6"
+        android:pathData="M54,27 L54,74.25 L81,74.25 Z" />
+
+    <!-- Hull wave arc -->
+    <path
+        android:strokeColor="#9CDEF2"
+        android:strokeWidth="3.5"
+        android:fillColor="#00000000"
+        android:strokeLineCap="round"
+        android:pathData="M13.5,81 Q33.75,67.5 54,81 Q74.25,94.5 94.5,81" />
+
+</vector>
