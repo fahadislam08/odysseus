@@ -5,7 +5,7 @@ import re
 import difflib
 import fnmatch
 import shutil
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any, Tuple
 
 from src.constants import MAX_READ_CHARS, MAX_DIFF_LINES, MAX_OUTPUT_CHARS
 
@@ -186,21 +186,6 @@ class WriteFileTool:
         lines = content.split("\n", 1)
         raw_path = lines[0].strip()
         body = lines[1] if len(lines) > 1 else ""
-        # Decode JSON-object args (the fenced inline-args shape
-        # ```write_file {"path": "...", "content": "..."}```), matching
-        # ReadFileTool above. Without this the whole JSON string becomes the
-        # path and the file is written under a garbage name. This is the live
-        # path: there is no filesystem MCP server, so write_file always runs
-        # here via _direct_fallback, not through _build_mcp_args.
-        _stripped = content.strip()
-        if _stripped.startswith("{"):
-            try:
-                _a = json.loads(_stripped)
-                if isinstance(_a, dict) and "path" in _a:
-                    raw_path = str(_a.get("path", "")).strip()
-                    body = str(_a.get("content", ""))
-            except (json.JSONDecodeError, TypeError, ValueError):
-                pass
         try:
             path = _resolve_tool_path(raw_path)
         except ValueError as e:
@@ -229,181 +214,6 @@ class WriteFileTool:
         if diff:
             result["diff"] = diff
         return result
-
-class ApplyPatchTool:
-    async def execute(self, content: str, ctx: dict) -> dict:
-        """Apply a small Codex-style patch using exact context matching.
-
-        This is deliberately stricter than git-apply: if an update hunk's old
-        text is not found exactly once, the whole patch is rejected before any
-        file is changed. That keeps agent edits reviewable and avoids fuzzy
-        corruption when the model patches stale context.
-        """
-        from src.tool_execution import _resolve_tool_path
-
-        patch_text = content or ""
-        stripped = patch_text.strip()
-        if stripped.startswith("{"):
-            try:
-                args = json.loads(stripped)
-                if isinstance(args, dict):
-                    patch_text = str(args.get("patch_text") or args.get("patchText") or args.get("patch") or "")
-            except (json.JSONDecodeError, TypeError):
-                pass
-        if not patch_text.strip():
-            return {"error": "apply_patch: patch_text required", "exit_code": 1}
-
-        try:
-            ops = _parse_agent_patch(patch_text)
-            if not ops:
-                return {"error": "apply_patch: no file operations found", "exit_code": 1}
-            prepared = []
-            for op in ops:
-                path = _resolve_tool_path(op["path"])
-                kind = op["kind"]
-                if kind == "add":
-                    if os.path.exists(path):
-                        return {"error": f"apply_patch: {op['path']}: already exists", "exit_code": 1}
-                    old = ""
-                    new = op["content"]
-                elif kind == "delete":
-                    if not os.path.isfile(path):
-                        return {"error": f"apply_patch: {op['path']}: not found", "exit_code": 1}
-                    with open(path, "r", encoding="utf-8") as f:
-                        old = f.read()
-                    new = ""
-                else:
-                    if not os.path.isfile(path):
-                        return {"error": f"apply_patch: {op['path']}: not found", "exit_code": 1}
-                    with open(path, "r", encoding="utf-8") as f:
-                        old = f.read()
-                    new = _apply_patch_hunks(old, op["hunks"], op["path"])
-                prepared.append((kind, path, old, new))
-
-            diffs = []
-            for kind, path, old, new in prepared:
-                if kind == "delete":
-                    os.remove(path)
-                else:
-                    directory = os.path.dirname(path)
-                    if directory:
-                        os.makedirs(directory, exist_ok=True)
-                    with open(path, "w", encoding="utf-8") as f:
-                        f.write(new)
-                diff = _unified_diff(old, new, path)
-                if diff:
-                    diffs.append(diff)
-        except (ValueError, UnicodeDecodeError, PermissionError, OSError) as e:
-            return {"error": f"apply_patch: {e}", "exit_code": 1}
-
-        added = sum(int(d.get("added") or 0) for d in diffs)
-        removed = sum(int(d.get("removed") or 0) for d in diffs)
-        text_parts = [d.get("text", "") for d in diffs if d.get("text")]
-        diff_text = "\n".join(text_parts)
-        if len(diff_text.splitlines()) > MAX_DIFF_LINES:
-            diff_text = "\n".join(diff_text.splitlines()[:MAX_DIFF_LINES]) + f"\n... diff truncated at {MAX_DIFF_LINES} lines"
-        result = {
-            "output": f"Applied patch ({len(prepared)} file{'s' if len(prepared) != 1 else ''}, +{added}/-{removed})",
-            "exit_code": 0,
-        }
-        if diffs:
-            result["diff"] = {
-                "text": diff_text,
-                "added": added,
-                "removed": removed,
-                "new_file": any(d.get("new_file") for d in diffs),
-                "file": "patch",
-            }
-        return result
-
-def _parse_agent_patch(patch_text: str) -> List[Dict[str, Any]]:
-    lines = patch_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    while lines and not lines[0].strip():
-        lines.pop(0)
-    while lines and not lines[-1].strip():
-        lines.pop()
-    if not lines or lines[0].strip() != "*** Begin Patch":
-        raise ValueError("patch must start with *** Begin Patch")
-    if lines[-1].strip() != "*** End Patch":
-        raise ValueError("patch must end with *** End Patch")
-
-    ops: List[Dict[str, Any]] = []
-    i = 1
-    while i < len(lines) - 1:
-        line = lines[i]
-        if not line:
-            i += 1
-            continue
-        if line.startswith("*** Add File: "):
-            path = line[len("*** Add File: "):].strip()
-            body = []
-            i += 1
-            while i < len(lines) - 1 and not lines[i].startswith("*** "):
-                if not lines[i].startswith("+"):
-                    raise ValueError(f"add file {path}: every content line must start with +")
-                body.append(lines[i][1:])
-                i += 1
-            ops.append({"kind": "add", "path": path, "content": "\n".join(body) + ("\n" if body else "")})
-            continue
-        if line.startswith("*** Delete File: "):
-            path = line[len("*** Delete File: "):].strip()
-            ops.append({"kind": "delete", "path": path})
-            i += 1
-            continue
-        if line.startswith("*** Update File: "):
-            path = line[len("*** Update File: "):].strip()
-            hunks = []
-            current = []
-            i += 1
-            if i < len(lines) - 1 and lines[i].startswith("*** Move to: "):
-                raise ValueError("move operations are not supported")
-            while i < len(lines) - 1 and not lines[i].startswith("*** "):
-                if lines[i].startswith("@@"):
-                    if current:
-                        hunks.append(current)
-                        current = []
-                elif lines[i].startswith((" ", "-", "+")):
-                    current.append(lines[i])
-                elif lines[i] == "":
-                    current.append(" ")
-                else:
-                    raise ValueError(f"update file {path}: invalid patch line {lines[i]!r}")
-                i += 1
-            if current:
-                hunks.append(current)
-            if not hunks:
-                raise ValueError(f"update file {path}: no hunks")
-            ops.append({"kind": "update", "path": path, "hunks": hunks})
-            continue
-        raise ValueError(f"unexpected patch line: {line!r}")
-    return ops
-
-def _apply_patch_hunks(original: str, hunks: List[List[str]], label: str) -> str:
-    updated = original
-    for idx, hunk in enumerate(hunks, 1):
-        old_lines = []
-        new_lines = []
-        for line in hunk:
-            prefix, body = line[:1], line[1:]
-            if prefix in (" ", "-"):
-                old_lines.append(body)
-            if prefix in (" ", "+"):
-                new_lines.append(body)
-        old_text = "\n".join(old_lines)
-        new_text = "\n".join(new_lines)
-        if old_text and old_text in updated:
-            occurrences = updated.count(old_text)
-            if occurrences != 1:
-                raise ValueError(f"{label}: hunk {idx} context matched {occurrences} times")
-            updated = updated.replace(old_text, new_text, 1)
-        elif old_text + "\n" in updated:
-            occurrences = updated.count(old_text + "\n")
-            if occurrences != 1:
-                raise ValueError(f"{label}: hunk {idx} context matched {occurrences} times")
-            updated = updated.replace(old_text + "\n", new_text + "\n", 1)
-        else:
-            raise ValueError(f"{label}: hunk {idx} context not found")
-    return updated
 
 class LsTool:
     async def execute(self, content: str, ctx: dict) -> dict:
@@ -456,13 +266,7 @@ class LsTool:
 
 class GlobTool:
     async def execute(self, content: str, ctx: dict) -> dict:
-        from src.tool_execution import (
-            _SENSITIVE_BASENAMES,
-            _is_sensitive_path,
-            _resolve_tool_path,
-            _resolve_search_root,
-            _truncate,
-        )
+        from src.tool_execution import _resolve_tool_path, _resolve_search_root, _truncate
         args = {}
         _s = (content or "").strip()
         if _s.startswith("{"):
@@ -484,30 +288,11 @@ class GlobTool:
             base = os.path.abspath(root)
             if not os.path.isdir(base):
                 return None, f"glob: {root}: not a directory"
-            rbase = os.path.realpath(base)
             norm_pat = pattern.replace("\\", "/")
             # Fast path: literal pattern (no wildcards) → direct path lookup.
             if not any(c in norm_pat for c in "*?["):
-                cand = os.path.realpath(os.path.join(base, norm_pat))
-                # Keep the literal lookup inside the search root. os.path.join
-                # lets an absolute pattern (or one containing ../) escape `base`,
-                # which would turn glob into an existence/path oracle for
-                # arbitrary host files — bypassing the workspace/allowlist
-                # confinement that _resolve_search_root applies to the root.
-                # An escaping literal falls through to the walk, which only ever
-                # yields paths under base.
-                nbase = os.path.normcase(rbase)
-                try:
-                    inside = cand == rbase or os.path.commonpath(
-                        [os.path.normcase(cand), nbase]
-                    ) == nbase
-                except ValueError:
-                    inside = False
-                # A literal that names a deny-listed sensitive file (.env,
-                # .ssh/id_rsa, …) falls through to the walk, which skips it —
-                # otherwise glob would surface secret paths that read_file /
-                # grep already refuse to touch.
-                if inside and os.path.exists(cand) and not _is_sensitive_path(cand):
+                cand = os.path.normpath(os.path.join(base, norm_pat))
+                if os.path.exists(cand):
                     return [cand], None
                 # Literal not at exact path — fall through to walk so
                 # e.g. "foo.py" still matches at any depth (like rglob).
@@ -519,20 +304,11 @@ class GlobTool:
                 for dp, dns, fns in os.walk(base):
                     # Prune skipped dirs before descending (unlike rglob which
                     # descends first then filters — fatal on large node_modules).
-                    # Sensitive dirs (.ssh, .gnupg, …) are pruned too so glob
-                    # never enumerates the keys/tokens inside them.
-                    dns[:] = [
-                        d for d in dns
-                        if d not in _CODENAV_SKIP_DIRS and d not in _SENSITIVE_BASENAMES
-                    ]
+                    dns[:] = [d for d in dns if d not in _CODENAV_SKIP_DIRS]
                     for name in fns + dns:
                         full = os.path.join(dp, name)
                         rel = os.path.relpath(full, base).replace(os.sep, "/")
                         if regex.fullmatch(rel) or regex.fullmatch(name):
-                            # Skip deny-listed sensitive files (.env, id_rsa,
-                            # known_hosts, …) the same way grep does.
-                            if _is_sensitive_path(os.path.realpath(full)):
-                                continue
                             try:
                                 mtime = os.stat(full).st_mtime
                             except OSError:
@@ -557,13 +333,7 @@ class GlobTool:
 
 class GrepTool:
     async def execute(self, content: str, ctx: dict) -> dict:
-        from src.tool_execution import (
-            _SENSITIVE_FILE_PATTERNS,
-            _is_sensitive_path,
-            _resolve_tool_path,
-            _resolve_search_root,
-            _truncate,
-        )
+        from src.tool_execution import _resolve_tool_path, _resolve_search_root, _truncate
         args: Dict[str, Any] = {}
         _s = (content or "").strip()
         if _s.startswith("{"):
@@ -599,12 +369,6 @@ class GrepTool:
                     cmd.append("--ignore-case")
                 if glob_pat:
                     cmd += ["--glob", glob_pat]
-                # --iglob (not --glob) so the exclusion is case-insensitive:
-                # on a case-insensitive filesystem "ID_RSA"/"Known_Hosts"
-                # resolve to the same secret as their lowercase forms, and the
-                # Python fallback below already folds case via _is_sensitive_path.
-                for _pat in _SENSITIVE_FILE_PATTERNS:
-                    cmd += ["--iglob", f"!*{_pat}*"]
                 for _d in _CODENAV_SKIP_DIRS:
                     cmd += ["--glob", f"!**/{_d}/**"]
                 cmd += ["--regexp", pattern, root]
@@ -635,8 +399,6 @@ class GrepTool:
             for fp in file_iter:
                 if len(hits) >= max_hits:
                     break
-                if _is_sensitive_path(os.path.realpath(fp)):
-                    continue
                 try:
                     with open(fp, "r", encoding="utf-8", errors="strict") as f:
                         for i, line in enumerate(f, 1):

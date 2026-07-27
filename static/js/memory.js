@@ -6,7 +6,6 @@ import sessionModule from './sessions.js';
 import spinnerModule from './spinner.js';
 import { makeWindowDraggable } from './windowDrag.js';
 import { snapModalToZone } from './tileManager.js';
-import { topPortalZ } from './toolWindowZOrder.js';
 
 var escapeHtml = uiModule.esc;
 
@@ -15,7 +14,6 @@ let activeCategory = 'all';
 let sortOrder = 'newest';
 let selectMode = false;
 let selectedIds = new Set();
-let memoriesLoading = false;
 
 
 const MEMORY_CATEGORIES = ['fact', 'identity', 'preference', 'contact', 'project', 'goal', 'task'];
@@ -371,16 +369,12 @@ async function syncPrefToggle(elementId, prefKey, onMsg, offMsg, dimBelow = true
 
 export async function loadMemories() {
   _ensureNewMemoryCategorySelect();
-  memoriesLoading = true;
-  renderMemoryList();
-  updateMemoryCount();
   try {
     const response = await fetch(`${window.location.origin}/api/memory`);
 
     if (!response.ok) {
       console.error('Memory fetch failed with status:', response.status);
       memories = [];
-      memoriesLoading = false;
       buildCategoryChips();
       renderMemoryList();
       updateMemoryCount();
@@ -398,14 +392,12 @@ export async function loadMemories() {
       memories = [];
     }
 
-    memoriesLoading = false;
     buildCategoryChips();
     renderMemoryList();
     updateMemoryCount();
   } catch (error) {
     console.error('Failed to load memories:', error);
     memories = [];
-    memoriesLoading = false;
     buildCategoryChips();
     renderMemoryList();
     updateMemoryCount();
@@ -696,12 +688,6 @@ export function renderMemoryList() {
     const selectBtn = document.getElementById('memory-select-btn');
     if (selectBtn) selectBtn.disabled = true;
     if (selectMode) exitSelectMode();
-    if (memoriesLoading) {
-      const row = spinnerModule.createLoadingRow('Loading memories...', 14);
-      row.classList.add('memory-empty');
-      memoryList.replaceChildren(row);
-      return;
-    }
     const searchTerm = document.getElementById('memory-search')?.value?.trim() || '';
     const _smiley = '<span style="vertical-align:-3px;margin-left:6px;">' + uiModule.emptyStateIcon('smiley') + '</span>';
     if (searchTerm || activeCategory !== 'all') {
@@ -879,13 +865,7 @@ export function renderMemoryList() {
         dropdown.style.top = rect.bottom + 2 + 'px';
         dropdown.style.right = (window.innerWidth - rect.right) + 'px';
         dropdown.style.left = 'auto';
-        // Portaled to <body>, so it must outrank the Brain modal it belongs to.
-        // Tool modals get a monotonically increasing z-index from modalManager's
-        // bring-to-front counter, which climbs unbounded over a long session —
-        // once it passed the old hardcoded 10001 the menu rendered behind the
-        // panel (#4720). topPortalZ() derives the value from the live tool-window
-        // stack so the menu always sits just above, however high it has climbed.
-        dropdown.style.zIndex = String(topPortalZ());
+        dropdown.style.zIndex = '10001';
         dropdown.style.display = 'block';
         document.body.appendChild(dropdown);
         // Keep on-screen (mobile): flip above the button if it overflows the
@@ -1078,11 +1058,6 @@ export function updateMemoryCount() {
   const h2Count = document.getElementById('memory-count-h2');
   const tabCount = document.getElementById('memory-count'); // optional (may be absent)
   if (!h2Count && !tabCount) return;
-  if (memoriesLoading) {
-    if (h2Count) h2Count.textContent = 'loading...';
-    if (tabCount) tabCount.textContent = '...';
-    return;
-  }
 
   const searchInput = document.getElementById('memory-search');
   const searchTerm = searchInput ? searchInput.value.toLowerCase().trim() : '';

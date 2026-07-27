@@ -22,8 +22,8 @@ for mod in [
     if mod not in sys.modules:
         sys.modules[mod] = MagicMock()
 
-import src.agent_tools  # noqa: F401
-from src.tool_parsing import parse_tool_blocks, strip_tool_blocks
+import src.agent_tools  # noqa: E402, F401
+from src.tool_parsing import parse_tool_blocks, strip_tool_blocks  # noqa: E402
 
 
 def test_raw_json_after_web_search_phrase_runs_as_web_search():

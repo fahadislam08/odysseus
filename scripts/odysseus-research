@@ -52,14 +52,6 @@ def _load_path(path: Path) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def _load_path(path: Path) -> dict | None:
-    try:
-        data = json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-    return data if isinstance(data, dict) else None
-
-
 def _load(rp_id: str) -> dict | None:
     path = _DATA_DIR / f"{rp_id}.json"
     if not path.exists():

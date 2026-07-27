@@ -6,6 +6,7 @@ so the HTML branch extracted nothing and web_fetch reported "no readable text
 content". The plain-text branch returns the body as-is. HTML stays on the
 parsing path.
 """
+import types
 
 import pytest
 
