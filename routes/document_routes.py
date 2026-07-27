@@ -7,23 +7,12 @@ from typing import Dict, Any, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request, UploadFile, File, Form
 
-from sqlalchemy import case, func, or_
+from sqlalchemy import func
 from core.database import SessionLocal, Document, DocumentVersion
 from core.database import Session as DbSession
-from src.auth_helpers import get_current_user, _auth_disabled
-from src.constants import MAIL_ATTACHMENTS_DIR
-from src.upload_handler import reserve_upload_references
+from src.auth_helpers import get_current_user
 
 logger = logging.getLogger(__name__)
-
-
-def _get_session_or_404(db, session_id: str, user: Optional[str]):
-    session = db.query(DbSession).filter(DbSession.id == session_id).first()
-    if not session:
-        raise HTTPException(404, "Session not found")
-    if user and session.owner != user:
-        raise HTTPException(404, "Session not found")
-    return session
 
 
 def _aggregate_language_facets(lang_rows):
@@ -41,31 +30,6 @@ def _aggregate_language_facets(lang_rows):
     return out
 
 
-def _library_language_for_document(doc: Document) -> str:
-    """Return the display language used by the document library.
-
-    PDF documents are stored as markdown wrappers so the editor can preserve
-    extracted text, form fields, and annotations. The library should still
-    identify them as PDFs instead of exposing that internal wrapper format.
-    """
-    from src.pdf_form_doc import find_source_upload_id
-
-    if find_source_upload_id(doc.current_content or ""):
-        return "pdf"
-    return doc.language or "text"
-
-
-def _email_source_key(content: str) -> tuple[str, str]:
-    """Return the source email identity embedded in an email draft document."""
-    import re
-
-    text = content or ""
-    uid_m = re.search(r"(?im)^X-Source-UID:\s*(.+?)\s*$", text)
-    folder_m = re.search(r"(?im)^X-Source-Folder:\s*(.+?)\s*$", text)
-    uid = (uid_m.group(1).strip() if uid_m else "")
-    folder = (folder_m.group(1).strip() if folder_m else "INBOX")
-    return uid, folder
-
 
 from routes.document_helpers import (
     DocumentCreate, DocumentUpdate, DocumentPatch,
@@ -78,14 +42,6 @@ from routes.document_helpers import (
 
 def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
     router = APIRouter(tags=["documents"])
-
-    def _reserve_document_uploads(user: Optional[str], content: str) -> None:
-        missing_id = reserve_upload_references(upload_handler, user, content)
-        if missing_id:
-            raise HTTPException(
-                409,
-                f"Referenced upload is no longer available: {missing_id}",
-            )
 
     def _locate_current_user_upload(request: Request, upload_id: str, user: Optional[str]):
         if upload_handler is None:
@@ -113,12 +69,20 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
             # the doc is owner-stamped, so it lives in the library on its own.
             session = None
             if req.session_id:
+                session = db.query(DbSession).filter(DbSession.id == req.session_id).first()
+                if not session:
+                    raise HTTPException(404, "Session not found")
                 # Match the lenient ownership model the rest of the app uses
                 # (see _owner_filter): only block when an AUTHENTICATED user is
                 # writing into a DIFFERENT user's session. In single-user /
-                # unconfigured / localhost-bypass mode, falsey users preserve
-                # the existing lenient path.
-                session = _get_session_or_404(db, req.session_id, user)
+                # unconfigured / localhost-bypass mode the middleware leaves
+                # current_user unset (None), and those sessions are already
+                # served freely everywhere else.
+                if user and session.owner and session.owner != user:
+                    raise HTTPException(403, "Cannot create document in another user's session")
+
+            doc_id = str(uuid.uuid4())
+            ver_id = str(uuid.uuid4())
 
             # If no language was supplied (e.g. cloning a doc whose language
             # was never set), detect it from the content rather than storing
@@ -126,56 +90,14 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
             # to markdown for prose.
             language = req.language
             if not language:
-                from src.agent_tools.document_tools import _looks_like_email_document, _sniff_doc_language, _coerce_email_document_content
+                from src.tool_implementations import _looks_like_email_document, _sniff_doc_language
                 language = _sniff_doc_language(req.content)
             else:
-                from src.agent_tools.document_tools import _looks_like_email_document, _coerce_email_document_content
+                from src.tool_implementations import _looks_like_email_document
             if _looks_like_email_document(req.content, req.title):
                 language = "email"
 
-            _reserve_document_uploads(user, req.content)
             _assert_pdf_marker_upload_owned(request, req.content, user, upload_handler)
-
-            # Reply drafts are keyed to the source email. If a UI/tool path tries
-            # to create a second draft for the same email in the same chat,
-            # update the existing draft instead so quoted thread history stays
-            # attached to the visible document.
-            if language == "email" and req.session_id:
-                source_uid, source_folder = _email_source_key(req.content)
-                if source_uid:
-                    candidates = (
-                        db.query(Document)
-                        .filter(Document.session_id == req.session_id)
-                        .filter(Document.is_active == True)
-                        .filter(Document.language == "email")
-                        .order_by(Document.updated_at.desc())
-                        .limit(25)
-                        .all()
-                    )
-                    for existing in candidates:
-                        old_uid, old_folder = _email_source_key(existing.current_content or "")
-                        if old_uid != source_uid or old_folder != source_folder:
-                            continue
-                        merged = _coerce_email_document_content(existing.current_content or "", req.content)
-                        if existing.current_content != merged:
-                            new_ver = (existing.version_count or 1) + 1
-                            existing.current_content = merged
-                            existing.title = req.title or existing.title
-                            existing.version_count = new_ver
-                            db.add(DocumentVersion(
-                                id=str(uuid.uuid4()),
-                                document_id=existing.id,
-                                version_number=new_ver,
-                                content=merged,
-                                summary="Updated existing email draft",
-                                source="user",
-                            ))
-                            db.commit()
-                            db.refresh(existing)
-                        return _doc_to_dict(existing)
-
-            doc_id = str(uuid.uuid4())
-            ver_id = str(uuid.uuid4())
 
             doc = Document(
                 id=doc_id,
@@ -231,6 +153,7 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
         with a `pdf_source` marker so the viewer renders the pages without
         overlays.
         """
+        from src.constants import UPLOAD_DIR
         from src.pdf_forms import has_form_fields, extract_fields
         from src.pdf_form_doc import (
             save_field_sidecar,
@@ -249,7 +172,11 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
         if session_id:
             db = SessionLocal()
             try:
-                _get_session_or_404(db, session_id, user)
+                sess = db.query(DbSession).filter(DbSession.id == session_id).first()
+                if not sess:
+                    raise HTTPException(404, "Session not found")
+                if user and sess.owner and sess.owner != user:
+                    raise HTTPException(403, "Cannot import into another user's session")
             finally:
                 db.close()
 
@@ -272,7 +199,7 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
 
         title = os.path.splitext(meta.get("original_name") or meta.get("name") or upload_id)[0]
         try:
-            body_text = strip_pdf_content_marker(_process_pdf(pdf_path, owner=user))
+            body_text = strip_pdf_content_marker(_process_pdf(pdf_path))
         except Exception:
             body_text = None
 
@@ -334,29 +261,18 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
         db = SessionLocal()
         try:
             from sqlalchemy import or_
-            pdf_marker_cond = or_(
-                Document.current_content.like('%<!-- pdf_source upload_id="%'),
-                Document.current_content.like('%<!-- pdf_form_source upload_id="%'),
-            )
-            library_language_expr = case(
-                (pdf_marker_cond, "pdf"),
-                (Document.language.is_(None), "text"),
-                else_=Document.language,
-            )
             # Archived view shows ONLY archived docs; the default view excludes
             # them (NULL = legacy rows that predate the column = not archived).
             _arch_cond = (Document.archived == True) if archived else or_(
                 Document.archived == False, Document.archived.is_(None))
-            # Language facet counts (owner-filtered). PDF documents are stored
-            # as markdown wrappers, so group by the library display language
-            # instead of the raw stored language.
+            # Language facet counts (owner-filtered)
             lang_q = (
-                db.query(library_language_expr, func.count(Document.id))
+                db.query(Document.language, func.count(Document.id))
                 .outerjoin(DbSession, Document.session_id == DbSession.id)
                 .filter(Document.is_active == True).filter(_arch_cond)
             )
             lang_q = _owner_session_filter(lang_q, user)
-            lang_rows = lang_q.group_by(library_language_expr).all()
+            lang_rows = lang_q.group_by(Document.language).all()
             languages = _aggregate_language_facets(lang_rows)
 
             # Session count (owner-filtered)
@@ -388,17 +304,12 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
                         Document.title.ilike(term) | Document.current_content.ilike(term)
                     )
 
-            # Language filter. "pdf" is a display language derived from the
-            # source marker; "markdown" excludes those wrappers.
+            # Language filter
             if language:
                 if language == "text":
                     q = q.filter((Document.language == None) | (Document.language == "text"))
-                elif language == "pdf":
-                    q = q.filter(pdf_marker_cond)
                 else:
                     q = q.filter(Document.language == language)
-                    if language == "markdown":
-                        q = q.filter(~pdf_marker_cond)
 
             # Total before pagination
             total = q.count()
@@ -422,7 +333,7 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
                     "session_id": doc.session_id,
                     "session_name": session_name,
                     "title": doc.title,
-                    "language": _library_language_for_document(doc),
+                    "language": doc.language or "text",
                     "preview": (doc.current_content or "")[:500],
                     "version_count": doc.version_count,
                     "created_at": (doc.created_at.isoformat() + "Z") if doc.created_at else None,
@@ -448,19 +359,19 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
         db = SessionLocal()
         try:
             if not user:
-                if not _auth_disabled():
-                    raise HTTPException(403, "Authentication required")
+                raise HTTPException(403, "Authentication required")
+            session = db.query(DbSession).filter(DbSession.id == session_id).first()
             # v2 review HIGH-9: raise 403 explicitly when the caller
             # can't see this session, instead of returning [] which the
             # UI treats identically to "no docs" and silently masks
             # auth failures.
-            _get_session_or_404(db, session_id, user)
-            q = db.query(Document).filter(
+            if not session:
+                raise HTTPException(404, "Session not found")
+            if user and session.owner and session.owner != user:
+                raise HTTPException(403, "Access denied")
+            docs = db.query(Document).filter(
                 Document.session_id == session_id
-            )
-            if user:
-                q = q.filter(or_(Document.owner == user, Document.owner.is_(None)))
-            docs = q.order_by(Document.created_at.desc()).all()
+            ).order_by(Document.created_at.desc()).all()
             return [_doc_to_dict(d) for d in docs]
         finally:
             db.close()
@@ -527,7 +438,7 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
                 raise HTTPException(404, "Source PDF could not be located")
 
             try:
-                body_text = strip_pdf_content_marker(_process_pdf(pdf_path, owner=user))
+                body_text = strip_pdf_content_marker(_process_pdf(pdf_path))
             except Exception as e:
                 logger.error(f"extract_pdf_text failed for {pdf_path}: {e}")
                 raise HTTPException(500, f"Extraction failed: {e}")
@@ -564,8 +475,7 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
         user = get_current_user(request)
         try:
             data = await request.json()
-        except Exception as e:
-            logger.warning("Failed to parse export request body, defaulting to empty", exc_info=e)
+        except Exception:
             data = {}
         ids = data.get("ids") or []
         if not ids:
@@ -630,24 +540,11 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
                 raise HTTPException(404, "Document not found")
             _verify_doc_owner(db, doc, user)
 
-            incoming_content = req.content
-            from src.agent_tools.document_tools import _coerce_email_document_content, _looks_like_email_document
-            is_email_doc = (
-                (doc.language or "").lower() == "email"
-                or _looks_like_email_document(doc.current_content or "", doc.title or "")
-                or _looks_like_email_document(req.content or "", doc.title or "")
-            )
-            if is_email_doc:
-                incoming_content = _coerce_email_document_content(doc.current_content or "", req.content)
-                doc.language = "email"
-
-            # Skip if content is identical unless the caller explicitly wants
-            # a checkpoint version from the current editor state.
-            if doc.current_content == incoming_content and not req.force_version:
+            # Skip if content is identical
+            if doc.current_content == req.content:
                 return _doc_to_dict(doc)
 
-            _reserve_document_uploads(user, incoming_content)
-            _assert_pdf_marker_upload_owned(request, incoming_content, user, upload_handler)
+            _assert_pdf_marker_upload_owned(request, req.content, user, upload_handler)
 
             # Check if we can coalesce with the latest version
             latest_ver = db.query(DocumentVersion).filter(
@@ -656,14 +553,14 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
 
             now = datetime.now(timezone.utc)
             coalesced = False
-            if latest_ver and latest_ver.source == "user" and not req.force_version:
+            if latest_ver and latest_ver.source == "user":
                 ver_time = latest_ver.created_at
                 if ver_time.tzinfo is None:
                     ver_time = ver_time.replace(tzinfo=timezone.utc)
                 age = (now - ver_time).total_seconds()
                 if age < VERSION_COALESCE_SECONDS:
                     # Update the existing version in-place
-                    latest_ver.content = incoming_content
+                    latest_ver.content = req.content
                     latest_ver.created_at = now
                     if req.summary:
                         latest_ver.summary = req.summary
@@ -675,14 +572,14 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
                     id=str(uuid.uuid4()),
                     document_id=doc_id,
                     version_number=new_ver,
-                    content=incoming_content,
+                    content=req.content,
                     summary=req.summary or "Manual edit",
                     source="user",
                 )
                 doc.version_count = new_ver
                 db.add(ver)
 
-            doc.current_content = incoming_content
+            doc.current_content = req.content
             db.commit()
             db.refresh(doc)
             return _doc_to_dict(doc)
@@ -710,18 +607,16 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
                 doc.language = req.language
             if req.session_id is not None:
                 # Empty string = unlink from session
-                if req.session_id:
-                    _get_session_or_404(db, req.session_id, user)
                 doc.session_id = req.session_id if req.session_id else None
                 if not req.session_id:
                     # Tab closed / doc detached from its session — drop the
                     # in-memory active-doc pointer so the last-resort injection
                     # path doesn't re-surface this doc in a later chat (#1160).
                     try:
-                        from src.agent_tools.document_tools import clear_active_document
+                        from src.tool_implementations import clear_active_document
                         clear_active_document(doc_id)
-                    except Exception as e:
-                        logger.warning("Failed to clear active document %r on detach", doc_id, exc_info=e)
+                    except Exception:
+                        pass
             db.commit()
             db.refresh(doc)
             return _doc_to_dict(doc)
@@ -747,7 +642,7 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
             # Closed/deleted — drop the in-memory active-doc pointer so it isn't
             # re-injected into a later, unrelated chat (#1160).
             try:
-                from src.agent_tools.document_tools import clear_active_document
+                from src.tool_implementations import clear_active_document
                 clear_active_document(doc_id)
             except Exception:
                 pass
@@ -769,9 +664,8 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
         try:
             # Verify ownership before listing versions
             doc = db.query(Document).filter(Document.id == doc_id).first()
-            if not doc:
-                raise HTTPException(404, "Document not found")
-            _verify_doc_owner(db, doc, user)
+            if doc:
+                _verify_doc_owner(db, doc, user)
             versions = db.query(DocumentVersion).filter(
                 DocumentVersion.document_id == doc_id
             ).order_by(DocumentVersion.version_number.desc()).all()
@@ -794,9 +688,8 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
         try:
             # Verify ownership
             doc = db.query(Document).filter(Document.id == doc_id).first()
-            if not doc:
-                raise HTTPException(404, "Document not found")
-            _verify_doc_owner(db, doc, user)
+            if doc:
+                _verify_doc_owner(db, doc, user)
             ver = db.query(DocumentVersion).filter(
                 DocumentVersion.document_id == doc_id,
                 DocumentVersion.version_number == num,
@@ -872,26 +765,10 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
             from src.document_actions import _JUNK_TITLES
 
             to_delete = []
-            now = datetime.now(timezone.utc)
             for doc in docs:
-                created = doc.created_at
-                if created and created.tzinfo is None:
-                    created = created.replace(tzinfo=timezone.utc)
-
-                # Skip freshly created documents to avoid deleting them while the user is actively editing
-                if created and (now - created).total_seconds() < 900:  # 15 minutes
-                    continue
-
                 content = (doc.current_content or "").strip()
                 title_raw = (doc.title or "").strip()
                 title = title_raw.lower()
-                is_fresh_empty = (
-                    not content
-                    and created is not None
-                    and (now - created).total_seconds() < 1800
-                )
-                if is_fresh_empty:
-                    continue
 
                 # Strip markdown noise to get a "real" character count
                 stripped = _re.sub(r"^#{1,6}\s+", "", content, flags=_re.MULTILINE)
@@ -925,6 +802,10 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
                 if _is_email_stub:
                     to_delete.append(doc); deleted += 1; continue
                 if title in _JUNK_TITLES:
+                    to_delete.append(doc); deleted += 1; continue
+                if real_len < 30:
+                    to_delete.append(doc); deleted += 1; continue
+                if "\n" not in content and real_len < 50:
                     to_delete.append(doc); deleted += 1; continue
 
                 # Fix empty or placeholder titles on survivors
@@ -973,10 +854,10 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
         from src.llm_core import llm_call_async
 
         user = get_current_user(request)
-        url, model, headers = resolve_task_endpoint(owner=user or None)
+        url, model, headers = resolve_task_endpoint()
         if not url or not model:
             # Fall back to default endpoint
-            url, model, headers = resolve_endpoint("default", owner=user or None)
+            url, model, headers = resolve_endpoint("default")
         if not url or not model:
             raise HTTPException(500, "No endpoint configured for AI tidy")
 
@@ -1069,6 +950,7 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
         any wrong values before triggering the actual download.
         """
         from src.pdf_form_doc import find_source_upload_id, parse_markdown_to_values, load_field_sidecar
+        from src.constants import UPLOAD_DIR
 
         user = get_current_user(request)
         db = SessionLocal()
@@ -1133,6 +1015,7 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
         Frontend overlays HTML form controls at those positions.
         """
         from src.pdf_form_doc import find_source_upload_id, parse_markdown_to_values, load_field_sidecar
+        from src.constants import UPLOAD_DIR
 
         user = get_current_user(request)
         db = SessionLocal()
@@ -1200,6 +1083,7 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
         frontend overlays HTML form inputs on top)."""
         from fastapi.responses import Response
         from src.pdf_form_doc import find_source_upload_id
+        from src.constants import UPLOAD_DIR
 
         user = get_current_user(request)
         db = SessionLocal()
@@ -1248,6 +1132,7 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
         import json
         import fitz
         from src.pdf_form_doc import find_source_upload_id
+        from src.constants import UPLOAD_DIR
         from src.document_processor import _resolve_vl_model, _load_vl_settings
         from src.llm_core import llm_call_async
 
@@ -1276,7 +1161,7 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
         settings = _load_vl_settings()
         vl_model = settings.get("vision_model", "")
         try:
-            url, model_id, headers = _resolve_vl_model(vl_model, owner=user)
+            url, model_id, headers = _resolve_vl_model(vl_model)
         except Exception as e:
             raise HTTPException(503, f"No vision model available: {e}")
 
@@ -1390,6 +1275,7 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
         from starlette.background import BackgroundTask
         from src.pdf_form_doc import find_source_upload_id, parse_markdown_to_values, parse_markdown_annotations
         from src.pdf_forms import fill_fields, stamp_annotations
+        from src.constants import UPLOAD_DIR
         from core.database import Signature
 
         # Track temp files for this request so they get unlinked AFTER
@@ -1417,12 +1303,6 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
             pdf_path = _locate_current_user_upload(request, upload_id, user)
             if not pdf_path:
                 raise HTTPException(404, f"Source PDF {upload_id} not found")
-
-            # Fail fast with a clear 503 if the optional PyMuPDF dependency
-            # is missing — fill_fields/stamp_annotations will otherwise
-            # raise RuntimeError deep inside and bubble out as a 500.
-            # Mirrors the convention in _load_pdf_viewer_fitz above.
-            _load_pdf_viewer_fitz()
 
             values = parse_markdown_to_values(doc.current_content or "")
             out_path = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
@@ -1490,6 +1370,7 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
         from starlette.background import BackgroundTask
         from src.pdf_form_doc import find_source_upload_id, parse_markdown_to_values, load_field_sidecar, parse_markdown_annotations
         from src.pdf_forms import fill_fields, stamp_signatures, stamp_annotations
+        from src.constants import UPLOAD_DIR
         from core.database import Signature
 
         _to_unlink: list[str] = []
@@ -1631,12 +1512,16 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
             load_field_sidecar, parse_markdown_annotations,
         )
         from src.pdf_forms import fill_fields, stamp_signatures, stamp_annotations
+        from src.constants import UPLOAD_DIR
         from core.database import Signature
         # COMPOSE_UPLOADS_DIR lives in email_routes — re-derive here so we
         # don't import from a routes file (cycle-prone). Same env override
         # as email_routes (ODYSSEUS_MAIL_ATTACHMENTS_DIR).
         from pathlib import Path as _Path
-        _COMPOSE_DIR = _Path(MAIL_ATTACHMENTS_DIR) / "_compose"
+        import os as _os
+        _DATA_DIR = _Path(__file__).resolve().parent.parent / "data"
+        _BASE = _os.environ.get("ODYSSEUS_MAIL_ATTACHMENTS_DIR", str(_DATA_DIR / "mail-attachments"))
+        _COMPOSE_DIR = _Path(_BASE) / "_compose"
         _COMPOSE_DIR.mkdir(parents=True, exist_ok=True)
 
         user = get_current_user(request)
@@ -1752,11 +1637,9 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
             #    context (To/Subject/In-Reply-To/References).
             try:
                 from routes.email_routes import _imap, _decode_header
-                from routes.email_helpers import _q
             except Exception:
                 _imap = None
                 _decode_header = lambda x: x or ""
-                _q = lambda x: x or ""
 
             to_addr = ""
             from_name = ""
@@ -1766,7 +1649,7 @@ def setup_document_routes(session_manager, upload_handler=None) -> APIRouter:
             if _imap:
                 try:
                     with _imap(doc.source_email_account_id or None) as conn:
-                        conn.select(_q(doc.source_email_folder), readonly=True)
+                        conn.select(doc.source_email_folder, readonly=True)
                         status, data = conn.fetch(doc.source_email_uid.encode(), "(RFC822.HEADER)")
                     if status == "OK" and data and data[0]:
                         raw_hdr = data[0][1]

@@ -5,9 +5,7 @@ Auto-compacts conversation history when approaching context window limits.
 Summarizes older messages via the same LLM, preserving key context.
 """
 
-import json
 import logging
-import re
 from typing import Any, Dict, List, Optional
 
 from src.model_context import get_context_length, estimate_tokens
@@ -69,14 +67,6 @@ What is the system/code/task state right now? What was the last thing discussed?
 - Specific values: model names, ports, paths, credentials references, versions
 
 Keep the summary under 1000 tokens. Be dense — every token should carry information. Do not include pleasantries or meta-commentary."""
-
-
-def normalize_compaction_summary(summary: str) -> str:
-    """Remove redundant leading title text before adding our wrapper."""
-    text = (summary or "").strip()
-    text = re.sub(r"^(?:#{1,3}\s*)?Conversation Summary\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"^\*\*Conversation Summary\*\*\s*", "", text, flags=re.IGNORECASE)
-    return text.lstrip()
 
 
 def _sanitize_tool_messages(msgs: List[Dict]) -> List[Dict]:
@@ -156,53 +146,15 @@ def _truncate_text_to_token_budget(text: str, token_budget: int) -> str:
     return text[:head_len].rstrip() + notice + "\n\n" + text[-tail_len:].lstrip()
 
 
-def _truncate_tool_call_args(msg: Dict[str, Any], token_budget: int) -> Dict[str, Any]:
-    """Shrink oversized assistant ``tool_calls`` arguments to fit ``token_budget``.
-
-    A tool-only turn persists ``content=None`` with its whole payload in
-    ``tool_calls[].function.arguments`` (e.g. a large create_document body), which
-    the text-content truncation can't reach — so the message could stay over
-    budget and the upstream call would 400. Replace each argument string that
-    overflows its share of the budget with a small valid-JSON placeholder,
-    preserving ``id``/``type``/``function.name`` so tool/result pairing and
-    provider validation are unaffected. Returns msg unchanged when there is
-    nothing oversized.
-    """
-    tool_calls = msg.get("tool_calls")
-    if not isinstance(tool_calls, list) or not tool_calls:
-        return msg
-    # Budget left after whatever content survived (estimate_tokens counts tool
-    # arguments too, so measure content alone here).
-    content_tokens = estimate_tokens([{"role": msg.get("role", "assistant"), "content": msg.get("content")}])
-    per_call = max(16, (max(0, token_budget - content_tokens)) // len(tool_calls))
-    new_calls = []
-    changed = False
-    for tc in tool_calls:
-        fn = tc.get("function") if isinstance(tc, dict) else None
-        args = fn.get("arguments") if isinstance(fn, dict) else None
-        if isinstance(args, str) and int(len(args) * 0.3) > per_call:
-            new_fn = dict(fn)
-            new_fn["arguments"] = json.dumps({"_truncated_for_context": len(args)})
-            new_tc = dict(tc)
-            new_tc["function"] = new_fn
-            new_calls.append(new_tc)
-            changed = True
-        else:
-            new_calls.append(tc)
-    if not changed:
-        return msg
-    out = dict(msg)
-    out["tool_calls"] = new_calls
-    return out
-
-
 def _truncate_message_to_token_budget(msg: Dict[str, Any], token_budget: int) -> Dict[str, Any]:
-    """Return a copy of msg whose text content (and tool-call args) fit token_budget."""
+    """Return a copy of msg whose text content fits inside token_budget."""
     out = dict(msg)
     content = out.get("content", "")
     if isinstance(content, str):
         out["content"] = _truncate_text_to_token_budget(content, token_budget)
-    elif isinstance(content, list):
+        return out
+
+    if isinstance(content, list):
         remaining = token_budget
         new_content = []
         for item in content:
@@ -216,9 +168,7 @@ def _truncate_message_to_token_budget(msg: Dict[str, Any], token_budget: int) ->
             new_content.append(cloned)
             remaining -= _message_text_token_estimate(truncated)
         out["content"] = new_content
-    # A tool-only turn (content=None) carries its payload in tool_calls args,
-    # which the branches above can't shrink — handle it so the message can fit.
-    return _truncate_tool_call_args(out, token_budget)
+    return out
 
 
 def trim_for_context(messages: List[Dict], context_length: int, reserve_tokens: int = 512) -> List[Dict]:
@@ -253,17 +203,9 @@ def trim_for_context(messages: List[Dict], context_length: int, reserve_tokens: 
     protected_tokens = estimate_tokens(protected_msgs)
     budget -= protected_tokens
 
-    # Priority: keep first system msg (preset prompt), drop others (memory, RAG, memo).
-    # Exception: a research-spinoff primer (the seeded report that grounds a
-    # "Discuss" chat) must never be dropped — it is the conversation's whole
-    # knowledge base. Treat any system message carrying research_spinoff_from
-    # metadata as essential alongside the leading system prompt.
-    def _is_research_primer(m):
-        return bool((m.get("metadata") or {}).get("research_spinoff_from"))
-    _primers = [m for m in system_msgs if _is_research_primer(m)]
-    _non_primer = [m for m in system_msgs if not _is_research_primer(m)]
-    essential_system = (_non_primer[:1] if _non_primer else []) + _primers
-    extra_system = _non_primer[1:]
+    # Priority: keep first system msg (preset prompt), drop others (memory, RAG, memo)
+    essential_system = system_msgs[:1] if system_msgs else []
+    extra_system = system_msgs[1:]
 
     # Try dropping extra system messages one by one (from the end)
     trimmed = essential_system + convo_msgs
@@ -324,7 +266,6 @@ async def maybe_compact(
     model: str,
     messages: List[Dict],
     headers: Optional[Dict] = None,
-    owner: Optional[str] = None,
 ) -> tuple:
     """Check context usage and compact if above threshold.
 
@@ -371,7 +312,7 @@ async def maybe_compact(
     )
 
     # Use utility model if configured, otherwise fall back to session model
-    util_url, util_model, util_headers = resolve_endpoint("utility", owner=owner)
+    util_url, util_model, util_headers = resolve_endpoint("utility")
     compact_url = util_url or endpoint_url
     compact_model = util_model or model
     compact_headers = util_headers if util_url else headers
@@ -398,11 +339,7 @@ async def maybe_compact(
         )
     except Exception as e:
         logger.error(f"Compaction summary failed: {e}")
-        # Degrade gracefully: keep the conversation intact rather than
-        # silently dropping the older half. was_compacted=False signals the
-        # caller nothing was summarized; trim_for_context handles length.
-        return messages, context_length, False
-    summary = normalize_compaction_summary(summary)
+        return system_msgs + recent, context_length, False
 
     summary_msg = {
         "role": "system",
@@ -449,7 +386,6 @@ def _update_session_history(session, split_point: int, summary: str,
     # messages so the system prompt survives compaction.
     system_prefix = list(session.history[:system_msg_count])
     recent_history = session.history[effective_split:]
-    summary = normalize_compaction_summary(summary)
     summary_msg = ChatMessage(
         role="system",
         content=f"[Conversation summary]\n{summary}",
@@ -457,8 +393,8 @@ def _update_session_history(session, split_point: int, summary: str,
     )
     new_history = system_prefix + [summary_msg] + recent_history
     try:
-        from core.models import get_session_manager_instance
-        manager = get_session_manager_instance()
+        from core import models as _core_models
+        manager = getattr(_core_models, "_session_manager", None)
     except Exception:
         manager = None
     if manager and getattr(session, "id", None):

@@ -64,40 +64,20 @@ def is_youtube_url(url: str) -> bool:
     return "youtube.com" in url or "youtu.be" in url
 
 
-# youtube.com-shaped hosts. music.youtube.com serves the same /watch and
-# /shorts paths, so links shared from YouTube Music must resolve too.
-_YT_HOSTS = ("www.youtube.com", "youtube.com", "m.youtube.com", "music.youtube.com")
-# Path prefixes whose first following segment is the video id. Covers the
-# /embed/ player, Shorts (/shorts/), live streams (/live/), and the legacy
-# /v/ embed — all of which `is_youtube_url` already treats as YouTube, so
-# they must be extractable or the link is silently dropped (neither web-fetched
-# nor transcript-fetched) by the chat pipeline.
-_YT_PATH_PREFIXES = ("/embed/", "/shorts/", "/live/", "/v/")
-
-
 def extract_youtube_id(url: str) -> Optional[str]:
-    """Extract a YouTube video ID from the common URL shapes:
-    watch?v=, youtu.be/<id>, /embed/<id>, /shorts/<id>, /live/<id>, /v/<id>,
-    across youtube.com / m.youtube.com / music.youtube.com / youtu.be."""
+    """Extract YouTube video ID from various URL formats."""
     if not isinstance(url, str):
         return None
     parsed = urllib.parse.urlparse(url)
-    host = (parsed.hostname or "").lower()
-    if host in _YT_HOSTS:
+    if parsed.hostname in ("www.youtube.com", "youtube.com", "m.youtube.com"):
         if parsed.path == "/watch":
             params = urllib.parse.parse_qs(parsed.query)
-            if params.get("v"):
+            if "v" in params:
                 return params["v"][0]
-        else:
-            for prefix in _YT_PATH_PREFIXES:
-                if parsed.path.startswith(prefix):
-                    vid = parsed.path[len(prefix):].split("/")[0]
-                    if vid:
-                        return vid
-    elif host == "youtu.be":
-        vid = parsed.path.lstrip("/").split("/")[0]
-        if vid:
-            return vid
+        elif parsed.path.startswith("/embed/"):
+            return parsed.path.split("/")[-1]
+    elif parsed.hostname == "youtu.be":
+        return parsed.path[1:]
     return None
 
 
@@ -190,8 +170,6 @@ def format_transcript_for_context(
     if segments:
         ctx += "Timestamped Transcript:\n"
         for seg in segments:
-            if not isinstance(seg, dict):
-                continue
             ctx += f"[{seg['timestamp']}] {seg['text']}\n"
         # Check length — fall back to plain text if too long
         if len(ctx) > 12000:
@@ -224,24 +202,15 @@ async def fetch_youtube_comments(
             f"https://www.youtube.com/watch?v={video_id}",
         ]
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        proc = await asyncio.wait_for(
+            asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            ),
+            timeout=timeout,
         )
-        # Bound the wait on the process actually finishing, not on spawning it.
-        # create_subprocess_exec returns as soon as the child starts, so wrapping
-        # it in wait_for never enforces the timeout — proc.communicate() is the
-        # blocking step. Kill and reap the child if it overruns so it does not
-        # linger after we return.
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            raise
+        stdout, stderr = await proc.communicate()
 
         if proc.returncode != 0:
             return {"success": False, "error": f"yt-dlp failed: {stderr.decode()[:200]}", "comments": []}

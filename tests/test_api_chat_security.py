@@ -219,9 +219,6 @@ class _WebhookManager:
     async def fire(self, event, payload):
         return None
 
-    def fire_and_forget(self, event, payload):
-        return None
-
 
 def _install_sync_chat_stubs(monkeypatch):
     # FastAPI checks for python_multipart at import time when Form is used;

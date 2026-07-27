@@ -15,11 +15,10 @@ from pathlib import Path
 from typing import Optional, Dict
 
 from src.research_utils import is_low_quality
-from src.constants import DEEP_RESEARCH_DIR
 
 logger = logging.getLogger(__name__)
 
-RESEARCH_DATA_DIR = Path(DEEP_RESEARCH_DIR)
+RESEARCH_DATA_DIR = Path("data/deep_research")
 
 
 class ResearchHandler:
@@ -186,8 +185,6 @@ class ResearchHandler:
         seen = set()
         sources = []
         for f in findings:
-            if not isinstance(f, dict):
-                continue
             url = f.get("url", "")
             title = f.get("title", "") or url
             summary = f.get("summary", "") or f.get("evidence", "")
@@ -287,7 +284,6 @@ class ResearchHandler:
                 query, report, stats, elapsed,
                 findings=researcher.findings,
                 evolving_report=researcher.evolving_report,
-                analyzed_urls=getattr(researcher, "analyzed_urls", None),
             )
 
         except Exception as e:
@@ -334,8 +330,7 @@ class ResearchHandler:
 
     def _format_research_report(
         self, query: str, full_report: str, stats: dict, elapsed: float,
-        findings: Optional[list] = None, evolving_report: Optional[str] = None,
-        analyzed_urls: Optional[list] = None,
+        findings: list = None, evolving_report: str = None,
     ) -> str:
         """Format research report with sources list and expandable raw findings."""
         summary_lines = [
@@ -346,34 +341,20 @@ class ResearchHandler:
         ]
         summary_text = " | ".join(summary_lines)
 
-        # Build sources list with clickable links. Keep the curated Sources
-        # section filtered for citation quality, but also list every unique URL
-        # the research run inspected so the "URLs Analyzed" count is auditable.
+        # Build sources list with clickable links
         sources_section = ""
-        analyzed_urls_section = ""
-        url_items = analyzed_urls if analyzed_urls is not None else findings
-        if findings or url_items:
+        if findings:
             seen_urls = set()
             source_lines = []
-            analyzed_seen = set()
-            analyzed_lines = []
-            for f in findings or []:
+            for f in findings:
                 url = f.get("url", "")
                 title = f.get("title", "") or url
                 summary = f.get("summary", "") or f.get("evidence", "")
                 if url and url not in seen_urls and not is_low_quality(summary):
                     seen_urls.add(url)
                     source_lines.append(f"- [{title}]({url})")
-            for item in url_items or []:
-                url = item.get("url", "")
-                title = item.get("title", "") or url
-                if url and url not in analyzed_seen:
-                    analyzed_seen.add(url)
-                    analyzed_lines.append(f"{len(analyzed_lines) + 1}. [{title}]({url})")
             if source_lines:
                 sources_section = "\n### Sources\n\n" + "\n".join(source_lines) + "\n"
-            if analyzed_lines:
-                analyzed_urls_section = "\n### Analyzed URLs\n\n" + "\n".join(analyzed_lines) + "\n"
 
         # Build raw findings section (individual extractions per source)
         raw_findings_section = ""
@@ -409,7 +390,6 @@ class ResearchHandler:
 {full_report}
 
 {sources_section}
-{analyzed_urls_section}
 {collected_section}
 ---
 

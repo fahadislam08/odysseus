@@ -16,8 +16,7 @@ from typing import Callable, Dict, List, Optional, Set
 
 from src.research_utils import strip_thinking, is_low_quality
 
-from src.goal_based_extractor import EXTRACTOR_SYSTEM
-from src.prompt_security import untrusted_context_message
+from src.goal_based_extractor import EXTRACTOR_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -108,16 +107,13 @@ You are deciding whether a research report is comprehensive enough.
 **Current report:**
 {report}
 
-**Rounds completed:** {round_num} of {max_rounds}
+**Rounds completed:** {round_num}
 
 Based on the report so far, do we have enough information to answer the question \
 comprehensively?  Consider:
 - Are the key aspects of the question addressed?
 - Are there obvious gaps or unanswered sub-questions?
 - Is the evidence sufficient and from multiple sources?
-
-If rounds completed is well below the target, prefer continuing unless the \
-report is already exhaustive.
 
 Reply with ONLY "YES" or "NO" followed by a brief one-sentence reason.
 Example: "YES — The report covers all major aspects with evidence from multiple sources."
@@ -200,8 +196,6 @@ class DeepResearcher:
         max_content_chars: int = 15000,
         max_report_tokens: int = 8192,
         extraction_timeout: int = 90,
-        planning_timeout: int = 90,
-        query_timeout: int = 120,
         extraction_concurrency: int = 3,
         min_rounds: int = 2,
         max_empty_rounds: int = 2,
@@ -221,8 +215,6 @@ class DeepResearcher:
         self.max_content_chars = max_content_chars
         self.max_report_tokens = max_report_tokens
         self.extraction_timeout = min(3600, max(15, int(extraction_timeout or 90)))
-        self.planning_timeout = min(3600, max(15, int(planning_timeout or 90)))
-        self.query_timeout = min(3600, max(15, int(query_timeout or 120)))
         self.extraction_concurrency = min(12, max(1, int(extraction_concurrency or 3)))
         self.min_rounds = min_rounds
         self.max_empty_rounds = max_empty_rounds
@@ -232,7 +224,6 @@ class DeepResearcher:
         self._start_time: float = 0
         self.queries_used: Set[str] = set()
         self.urls_fetched: Set[str] = set()
-        self.analyzed_urls: List[Dict[str, str]] = []
         self.round_count: int = 0
         # Track which search providers actually returned results during the
         # run, in arrival order — surfaced in the visual report so users can
@@ -404,7 +395,7 @@ class DeepResearcher:
                 [{"role": "user", "content": prompt}],
                 temperature=0.3,
                 max_tokens=1024,
-                timeout=getattr(self, "planning_timeout", 90),
+                timeout=30,
             )
             # Try to parse as JSON for structured plan
             parsed = self._parse_json_object(response)
@@ -440,8 +431,7 @@ class DeepResearcher:
             )
             cat = (result or "").strip().lower()
             # Clean one-word answer first.
-            parts = cat.split()
-            first = parts[0].strip(".,\"'*:") if parts else ""
+            first = cat.split()[0].strip(".,\"'*:") if cat.split() else ""
             if first in CATEGORY_PROMPTS:
                 return first
             # Weak local models often wrap the label in preamble ("the category
@@ -488,7 +478,6 @@ class DeepResearcher:
                 [{"role": "user", "content": prompt}],
                 temperature=0.5,
                 max_tokens=4096,
-                timeout=getattr(self, "query_timeout", 120),
             )
             queries = self._parse_json_array(response)
             # Deduplicate
@@ -526,10 +515,6 @@ class DeepResearcher:
                 if url and url not in self.urls_fetched:
                     urls_to_fetch.append(r)
                     self.urls_fetched.add(url)
-                    self.analyzed_urls.append({
-                        "url": url,
-                        "title": r.get("title", "") or url,
-                    })
                 if len(urls_to_fetch) >= self.max_urls_per_round * len(queries):
                     break
 
@@ -632,12 +617,11 @@ class DeepResearcher:
             else:
                 content = truncated
 
+        prompt = EXTRACTOR_PROMPT.format(webpage_content=content, goal=question)
+
         try:
             response = await self._llm(
-                [
-                    {"role": "user", "content": EXTRACTOR_SYSTEM.format(goal=question)},
-                    untrusted_context_message("webpage", content),
-                ],
+                [{"role": "user", "content": prompt}],
                 temperature=0.2,
                 max_tokens=2048,
                 timeout=self.extraction_timeout,
@@ -709,7 +693,6 @@ class DeepResearcher:
             question=question,
             report=report,
             round_num=round_num,
-            max_rounds=self.max_rounds,
         )
 
         try:

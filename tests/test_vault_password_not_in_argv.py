@@ -12,8 +12,8 @@ The /unlock route previously did ``_run_bw(["unlock", req.master_password,
 vault) to any local user for the lifetime of the unlock subprocess.
 """
 
-import json
 import os
+import json
 import re
 import sys
 import types
@@ -42,7 +42,7 @@ if "core.platform_compat" not in sys.modules:
     _pc.which_tool = MagicMock(return_value="bw")
     sys.modules["core.platform_compat"] = _pc
 
-import routes.vault_routes as vr
+import routes.vault_routes as vr  # noqa: E402
 
 
 class _FakeProc:
@@ -102,8 +102,7 @@ def test_unlock_handler_feeds_password_on_stdin_not_argv():
 
 
 def test_tool_vault_unlock_feeds_password_on_stdin_not_argv():
-    with open("src/tools/vault.py", encoding="utf-8") as fh:
-        text = fh.read()
+    text = open("src/tool_implementations.py", encoding="utf-8").read()
 
     assert '["unlock", master_password, "--raw"]' not in text
     assert '_run_bw(["unlock", master_password' not in text

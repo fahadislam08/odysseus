@@ -1,18 +1,6 @@
 # app.py — slim orchestrator
 import mimetypes
 import os
-import sys
-import asyncio
-import time
-
-# On Windows, asyncio.create_subprocess_exec/shell require the ProactorEventLoop.
-# When started via `python -m uvicorn` from a terminal, uvicorn sets this
-# automatically. But the VS Code debugger (and other non-uvicorn entrypoints)
-# use the default SelectorEventLoop, which raises NotImplementedError on any
-# subprocess call. Force ProactorEventLoop here so the right loop is always
-# used, regardless of how the process is launched.
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 
 def register_static_mime_types() -> None:
@@ -46,11 +34,12 @@ from dotenv import load_dotenv
 # is silently ignored and the user is unexpectedly forced to log in (issue #142).
 # utf-8-sig reads plain UTF-8 (no BOM) identically, so this is safe everywhere.
 load_dotenv(encoding="utf-8-sig")
+import uuid
 
 import asyncio
 import logging
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Dict
 
 from contextlib import asynccontextmanager
@@ -384,11 +373,11 @@ if AUTH_ENABLED:
                     if _impersonate and _impersonate in getattr(_auth_mgr, "users", {}):
                         request.state.current_user = _impersonate
                     else:
-                        request.state.current_user = INTERNAL_TOOL_USER
+                        request.state.current_user = "internal-tool"
                     request.state.api_token = False
                     return await call_next(request)
-            except Exception as _e:
-                logger.warning("Internal tool auth header check failed", exc_info=_e)
+            except Exception:
+                pass
             # Allow DIRECT localhost requests (internal service calls from
             # heartbeats etc.). Tunnel/proxy-forwarded requests are excluded by
             # _is_trusted_loopback so LOCALHOST_BYPASS can't be abused over a
@@ -930,35 +919,7 @@ async def get_version():
 
 @app.get("/api/health")
 async def health_check() -> Dict[str, str]:
-    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
-
-@app.post("/api/client-perf")
-async def client_perf(request: Request):
-    """Low-volume frontend timing reports for stalls that happen before SSE logs."""
-    try:
-        data = await request.json()
-    except Exception:
-        data = {}
-    try:
-        kind = str(data.get("type") or "client").replace("\n", " ")[:80]
-        total_ms = float(data.get("total_ms") or 0)
-        stages = data.get("stages") if isinstance(data.get("stages"), list) else []
-        stage_txt = " ".join(
-            f"{str(s.get('name') or '')[:40]}={float(s.get('delta_ms') or 0):.0f}ms"
-            for s in stages[:20]
-            if isinstance(s, dict)
-        )
-        extra = str(data.get("extra") or "").replace("\n", " ")[:200]
-        logging.getLogger("app.client_perf").warning(
-            "client_perf type=%s total=%.0fms %s%s",
-            kind,
-            total_ms,
-            stage_txt,
-            f" extra={extra}" if extra else "",
-        )
-    except Exception:
-        logging.getLogger("app.client_perf").debug("client_perf log failed", exc_info=True)
-    return {"ok": True}
+    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
 @app.get("/api/ready")
 async def readiness_check() -> JSONResponse:
@@ -1056,20 +1017,20 @@ async def _startup_event():
 
     _startup_tasks.append(asyncio.create_task(_startup_mcp_connections()))
 
-    # Startup warmups are opt-in. They make later requests a little warmer, but
-    # they also compete with the first seconds of real UI use on slow or busy
-    # machines. Default to clear/idle startup and let requests warm what they use.
-    _startup_warmups_enabled = str(os.getenv("ODYSSEUS_STARTUP_WARMUPS", "")).lower() in {"1", "true", "yes", "on"}
-    if _startup_warmups_enabled:
-        async def _warmup_tool_index():
-            try:
-                from src.tool_index import get_tool_index
-                idx = await asyncio.to_thread(get_tool_index)
-                if idx:
-                    await asyncio.to_thread(idx.get_tools_for_query, "warmup", 8)
-                    logger.info("[startup] Tool index pre-warmed")
-            except Exception as e:
-                logger.warning(f"Tool index warmup failed (non-critical): {type(e).__name__}: {e}")
+    # Pre-warm the RAG tool index off the request path. Loading the local
+    # embedding model + opening ChromaDB + indexing the built-in tools is a
+    # one-time ~1-3s cost that otherwise lands on the user's FIRST message
+    # (showing up as a big `tool_selection` time). Doing it here makes the
+    # first turn as fast as subsequent ones (warm embed ≈ a few ms).
+    async def _warmup_tool_index():
+        try:
+            from src.tool_index import get_tool_index
+            idx = await asyncio.to_thread(get_tool_index)
+            if idx:
+                await asyncio.to_thread(idx.get_tools_for_query, "warmup", 8)
+                logger.info("[startup] Tool index pre-warmed")
+        except Exception as e:
+            logger.warning(f"Tool index warmup failed (non-critical): {type(e).__name__}: {e}")
 
         _startup_tasks.append(asyncio.create_task(_warmup_tool_index()))
 
@@ -1115,7 +1076,7 @@ async def _startup_event():
         owners = set()
         try:
             import json as _json
-            auth_path = AUTH_FILE
+            auth_path = "data/auth.json"
             with open(auth_path, encoding="utf-8") as f:
                 users = _json.load(f).get("users", {})
             owners.update(users.keys())
@@ -1162,7 +1123,7 @@ async def _startup_event():
     # does not make an existing library look empty after auth/account changes.
     try:
         import json as _json
-        auth_path = AUTH_FILE
+        auth_path = "data/auth.json"
         with open(auth_path, encoding="utf-8") as f:
             users = _json.load(f).get("users", {})
         primary_owner = None
@@ -1234,16 +1195,6 @@ async def _startup_event():
                 logger.warning(f"Nightly skill audit failed: {e}")
 
     _startup_tasks.append(asyncio.create_task(_skill_audit_nightly_loop()))
-
-    # Cookbook serve lifecycle — kills scheduler-launched serves whose
-    # window-end has passed. Paired with the cookbook_serve builtin
-    # action; both are no-ops unless a scheduled task actually launches
-    # something with end_after_min set. Removing this line + the
-    # cookbook_serve entry in BUILTIN_ACTIONS + src/cookbook_serve_lifecycle.py
-    # removes the feature.
-    from src.cookbook_serve_lifecycle import cookbook_serve_lifecycle_loop
-    _startup_tasks.append(asyncio.create_task(cookbook_serve_lifecycle_loop()))
-
     logger.info("Application startup complete")
 
 async def _shutdown_event():

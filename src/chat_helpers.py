@@ -13,8 +13,6 @@ from fastapi import HTTPException
 from fastapi import UploadFile
 from typing import List, Optional
 
-from src.upload_limits import format_byte_limit, get_chat_upload_max_bytes
-
 logger = logging.getLogger(__name__)
 
 
@@ -24,14 +22,7 @@ def extract_urls(text: str) -> List[str]:
     urls = re.findall(url_pattern, text)
     cleaned_urls = []
     for url in urls:
-        # Strip trailing sentence punctuation, but keep a balanced ')' so URLs
-        # that legitimately end in one are preserved, e.g. the Wikipedia link
-        # ".../Python_(programming_language)". A ')' is only dropped when it is
-        # unbalanced (more ')' than '('), which is the prose-glued case such as
-        # "(see https://example.com)".
-        url = re.sub(r'[.,;:!?]+$', '', url)
-        while url.endswith(')') and url.count(')') > url.count('('):
-            url = re.sub(r'[.,;:!?]+$', '', url[:-1])
+        url = re.sub(r'[.,;:!?\)]+$', '', url)
         cleaned_urls.append(url)
     return cleaned_urls
 
@@ -210,13 +201,12 @@ def validate_file_upload(file: UploadFile) -> UploadFile:
                 }
             )
 
-        upload_limit = get_chat_upload_max_bytes()
-        if file_size > upload_limit:
+        if file_size > 10 * 1024 * 1024:
             raise HTTPException(
                 status_code=400,
                 detail={
                     "error": "FILE_TOO_LARGE",
-                    "message": f"File size exceeds {format_byte_limit(upload_limit)} limit"
+                    "message": "File size exceeds 10MB limit"
                 }
             )
     except IOError as e:
