@@ -22,8 +22,9 @@ success, LLM exception, empty LLM result).
 This is intentionally a narrow interim/defensive fix for #4547; it does not
 replace the generated-query flow from #4557.
 """
-from src.chat_processor import ChatProcessor, _clean_search_query
+from typing import ClassVar
 
+from src.chat_processor import ChatProcessor, _clean_search_query
 
 # ── Unit tests: _clean_search_query ──
 
@@ -100,7 +101,7 @@ class _Session:
 
     endpoint_url = "http://example.local/v1"
     model = "test-model"
-    headers = {"Authorization": "Bearer test"}
+    headers: ClassVar[dict[str, str]] = {"Authorization": "Bearer test"}
 
 
 class _Memory:

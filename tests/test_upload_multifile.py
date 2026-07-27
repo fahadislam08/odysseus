@@ -24,9 +24,9 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 
 import core.database as cdb
-from core.database import GalleryImage
-from src.upload_handler import count_recent_uploads, UploadHandler
 import routes.upload_routes as up
+from core.database import GalleryImage
+from src.upload_handler import UploadHandler, count_recent_uploads
 
 _REPO = Path(__file__).resolve().parent.parent
 

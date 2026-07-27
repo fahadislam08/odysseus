@@ -10,16 +10,15 @@ against local servers so the pin is exercised end-to-end, not mocked away.
 import asyncio
 import http.server
 import ipaddress
+import os
 import socketserver
+import sys
 import threading
+from unittest.mock import patch
 
 import pytest
 
 from tests.helpers.import_state import clear_module, preserve_import_state
-
-import os
-import sys
-from unittest.mock import patch
 
 with patch.dict(os.environ, {"DATABASE_URL": "sqlite:///:memory:"}), \
         preserve_import_state("src.database", "core.database"):
@@ -75,7 +74,7 @@ def test_pinned_transport_connects_to_pinned_ip():
     hits = []
 
     class _Handler(http.server.BaseHTTPRequestHandler):
-        def do_POST(self):  # noqa: N802
+        def do_POST(self):
             length = int(self.headers.get("Content-Length", 0))
             self.rfile.read(length)
             hits.append(self.path)
@@ -113,7 +112,7 @@ def test_deliver_pins_to_validated_ip_end_to_end(monkeypatch):
     received = {}
 
     class _Handler(http.server.BaseHTTPRequestHandler):
-        def do_POST(self):  # noqa: N802
+        def do_POST(self):
             length = int(self.headers.get("Content-Length", 0))
             received["body"] = self.rfile.read(length)
             received["event"] = self.headers.get("X-Odysseus-Event")

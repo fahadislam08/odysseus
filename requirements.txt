@@ -44,6 +44,9 @@ qrcode[pil]
 croniter
 pytest
 pytest-asyncio
+# Fast Python linter/formatter used to catch import-order issues, unused code,
+# stale noqa comments, and other typo-like mistakes before review.
+ruff
 # starlette.testclient prefers httpx2 since Starlette 1.2.0 and warns on every
 # TestClient import when only classic httpx is present. Runtime code keeps
 # using `httpx` above; this is test-client only.

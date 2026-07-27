@@ -47,10 +47,15 @@ Windows is not actively tested. Docker on Linux or a Linux/macOS manual install 
 Run the smallest relevant checks for your change:
 
 ```bash
+python -m ruff check .
 python -m pytest
 python -m py_compile app.py routes/*.py src/*.py
 node --check static/js/<file-you-changed>.js
 ```
+
+Ruff is the fast Python lint pass. It catches import-order mistakes, unused
+imports, stale `noqa` comments, missing subprocess safety flags, and similar
+small issues that otherwise become noisy review comments.
 
 For Docker-related changes:
 
@@ -130,4 +135,3 @@ Issues with only "help", "does not work", or a screenshot without context may be
 Do not post secrets, API keys, private logs, personal documents, or public IPs in issues or pull requests.
 
 For security reports, follow [SECURITY.md](SECURITY.md).
-

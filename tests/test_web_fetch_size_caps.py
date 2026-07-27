@@ -9,11 +9,10 @@ import json
 from contextlib import contextmanager
 
 import pytest
-
-from src.constants import WEB_FETCH_SOFT_MAX_BYTES, WEB_FETCH_HARD_MAX_BYTES
-from services.search import content as content_mod
-
 import pytest as _pytest_for_client_stream_compat
+
+from services.search import content as content_mod
+from src.constants import WEB_FETCH_HARD_MAX_BYTES, WEB_FETCH_SOFT_MAX_BYTES
 
 
 @_pytest_for_client_stream_compat.fixture(autouse=True)
@@ -132,7 +131,7 @@ def test_max_bytes_override_raises_budget(monkeypatch, no_cache):
 
 def test_override_is_clamped_to_hard_cap(monkeypatch, no_cache):
     # Ask for more than the ceiling; the effective budget must be the ceiling.
-    fake = _patch_stream(monkeypatch, _FakeStream(b"z" * 10, chunk=4))
+    _patch_stream(monkeypatch, _FakeStream(b"z" * 10, chunk=4))
     r = content_mod.fetch_webpage_content(
         "https://example.com/a.txt", max_bytes=WEB_FETCH_HARD_MAX_BYTES * 10
     )
@@ -199,6 +198,7 @@ def test_oversized_title_does_not_hide_partial_notice(monkeypatch):
     # The partial-content notice is the PR's core contract; an untrusted,
     # oversized page title must not push it past MAX_OUTPUT_CHARS.
     import asyncio
+
     from src.agent_tools.web_tools import WebFetchTool
     from src.constants import MAX_OUTPUT_CHARS
 
@@ -225,6 +225,7 @@ def test_oversized_title_does_not_hide_partial_notice(monkeypatch):
 
 def test_tool_layer_emits_partial_notice_and_parses_full(monkeypatch):
     import asyncio
+
     from src.agent_tools.web_tools import WebFetchTool
 
     calls = {}
