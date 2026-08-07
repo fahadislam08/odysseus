@@ -757,7 +757,7 @@ async def build_chat_context(
 
     # Use RAG?
     use_rag_val = (str(use_rag).lower() != "false") if use_rag is not None else True
-    if incognito or not allow_tool_preprocessing or is_research_spinoff or casual_low_signal:
+    if incognito or is_research_spinoff:
         use_rag_val = False
 
     # If pre-fetched search context was provided (compare mode), skip live web search

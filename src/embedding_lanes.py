@@ -120,11 +120,21 @@ def _build_fastembed_client():
 
 
 def _build_custom_client():
-    from src.embeddings import EmbeddingClient, get_embedding_client
+    endpoint = _load_custom_endpoint()
 
-    client = get_embedding_client()
-    if isinstance(client, EmbeddingClient):
-        return client
+    if not endpoint:
+        return None
+
+    from src.embeddings import EmbeddingClient
+
+    client = EmbeddingClient(
+        url=endpoint["url"],
+        model=endpoint.get("model"),
+        api_key=endpoint.get("api_key"),
+    )
+
+    client.get_sentence_embedding_dimension()
+    return client
     raise RuntimeError("HTTP embedding lane unavailable")
 
 

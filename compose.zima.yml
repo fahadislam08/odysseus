@@ -1,0 +1,11 @@
+services:
+  odysseus:
+    volumes:
+      - type: bind
+        source: /DATA/Vault/Vault Mind
+        target: /app/data/Vault/Vault Mind
+        read_only: true
+
+      - type: bind
+        source: /DATA/Vault/AI Mind
+        target: /app/data/Vault/AI Mind

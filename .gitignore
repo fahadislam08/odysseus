@@ -102,3 +102,6 @@ compound.config.json
 *.error.log
 _scratch/
 /odysseus/
+
+# Local ZimaOS runtime data
+config/searxng/runtime/
